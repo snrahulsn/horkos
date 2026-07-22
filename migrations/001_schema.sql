@@ -21,6 +21,7 @@ CREATE TABLE agents (
   operator_id   uuid NOT NULL REFERENCES operators(id),
   pubkey        text UNIQUE NOT NULL,          -- hex Ed25519 public key
   privkey_enc   text NOT NULL,                 -- server-custodial, encrypted at rest
+  api_token_hash text UNIQUE,                  -- sha256 of the agent's bearer token
   name          text NOT NULL,                 -- e.g. "claude"
   locked        boolean NOT NULL DEFAULT false, -- true = RCA outstanding
   locked_oath_id uuid,                          -- which broken oath locked it
@@ -32,7 +33,7 @@ CREATE TABLE agents (
 -- ============================================================
 
 CREATE TYPE oath_status AS ENUM (
-  'DRAFT', 'OPEN', 'CLAIMED',
+  'DRAFT', 'DRAFT_EXPIRED', 'OPEN', 'CLAIMED',
   'KEPT', 'BROKEN', 'BROKEN_UNCONFIRMED', 'DISPUTED', 'WITHDRAWN', 'VOIDED'
 );
 
@@ -93,7 +94,7 @@ CREATE TRIGGER oaths_no_delete BEFORE DELETE ON oaths
 -- The one thing nobody can do: turn a terminal verdict into KEPT or blank.
 CREATE OR REPLACE FUNCTION forbid_verdict_rewrite() RETURNS trigger AS $$
 BEGIN
-  IF OLD.status IN ('KEPT','BROKEN','BROKEN_UNCONFIRMED','DISPUTED','WITHDRAWN','VOIDED')
+  IF OLD.status IN ('KEPT','BROKEN','BROKEN_UNCONFIRMED','DISPUTED','WITHDRAWN','VOIDED','DRAFT_EXPIRED')
      AND NEW.status IS DISTINCT FROM OLD.status THEN
     RAISE EXCEPTION 'HORKOS: verdict % is permanent', OLD.status;
   END IF;
