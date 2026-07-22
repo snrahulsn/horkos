@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<div style="{{ style }}">{{ label }}</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  renderVals() {
+    const v = this.props.verdict || "OPEN";
+    const ink = this.props.ink || "#0A0A0A";
+    const bg = this.props.bg || "#E9E7DE";
+    const red = this.props.red || "#E5251D";
+    const base = "display:inline-block;font-family:'IBM Plex Mono',monospace;font-weight:700;font-size:11px;letter-spacing:.06em;padding:6px 10px;white-space:nowrap;";
+    const styles = {
+      KEPT: `${base}background:${ink};color:${bg};border:2px solid ${ink};`,
+      DISPUTED: `${base}background:transparent;color:${red};border:2px solid ${red};`,
+      UNCONFIRMED: `${base}background:transparent;color:${red};border:2px dashed ${red};`,
+      BROKEN: `${base}background:${red};color:${bg};border:2px solid ${red};`,
+      OPEN: `${base}background:transparent;color:${ink};border:2px dashed ${ink};`
+    };
+    return { label: v, style: styles[v] || styles.OPEN };
+  }
+}
+</script>
+</body>
+</html>
