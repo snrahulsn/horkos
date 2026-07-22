@@ -39,12 +39,14 @@ export async function createCommitment(agentId, raw) {
         const refRow = await client.query(`SELECT nextval('oath_ref_seq') AS ref`);
         const ref = Number(refRow.rows[0].ref);
         const oath = await client.query(`INSERT INTO oaths (
-        ref, agent_id, domain, goal, commitment_hash, deadline, budget_cap_usd,
+        ref, agent_id, task_title, domain, task_type, complexity, risk_level, deliverable_type, required_tools,
+        goal, commitment_hash, deadline, budget_cap_usd,
         model_declared, specificity_grade, status, visibility, draft_expires_at,
         counterparty_email, counterparty_token
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'DRAFT',$10,$11,$12,$13)
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'DRAFT',$16,$17,$18,$19)
       RETURNING id, ref`, [
-            ref, agentId, c.domain, c.goal, hash, c.deadline, c.budget_cap_usd,
+            ref, agentId, c.task_title, c.domain, c.task_type, c.complexity, c.risk_level,
+            c.deliverable_type, c.required_tools, c.goal, hash, c.deadline, c.budget_cap_usd,
             c.model_declared, result.specificityGrade, c.visibility,
             new Date(now.getTime() + DRAFT_TTL_MS), c.counterparty_email,
             sha256Hex(token), // store hashed; raw token goes to counterparty only
@@ -62,9 +64,9 @@ export async function createCommitment(agentId, raw) {
         return {
             oath_id: oathId, ref, commitment_hash: hash,
             specificity_grade: result.specificityGrade,
-            activation_token: token, // caller delivers to counterparty
             draft_expires_at: new Date(now.getTime() + DRAFT_TTL_MS).toISOString(),
             status: 'DRAFT',
+            approval: 'The authenticated project owner must review and approve this exact contract in the HORKOS dashboard.',
         };
     });
 }
@@ -86,6 +88,47 @@ export async function activateOath(rawToken) {
        WHERE id = $1`, [oath.id, now, new Date(now.getTime() + VOID_WINDOW_MS), sha256Hex(nextToken)]);
         await logEvent(client, 'oath.activated', { ref: oath.ref });
         return { ref: oath.ref, status: 'OPEN', counterparty_token: nextToken };
+    });
+}
+/** Owner approves the exact frozen contract from an authenticated web session. */
+export async function activateOathAsOperator(oathId, authUserId) {
+    const now = new Date();
+    return tx(async (client) => {
+        const { rows } = await client.query(`SELECT o.id, o.ref, o.status, o.draft_expires_at, o.commitment_hash, op.id AS operator_id
+       FROM oaths o
+       JOIN agents a ON o.agent_id = a.id
+       JOIN operators op ON a.operator_id = op.id
+       WHERE o.id = $1 AND op.auth_user_id = $2
+       FOR UPDATE OF o`, [oathId, authUserId]);
+        if (!rows.length)
+            throw new GuardrailError(['unknown oath or not its owner']);
+        const oath = rows[0];
+        if (oath.status !== 'DRAFT')
+            throw new GuardrailError([`oath is ${oath.status}, not DRAFT`]);
+        if (new Date(oath.draft_expires_at) < now)
+            throw new GuardrailError(['draft expired (24h)']);
+        await client.query(`UPDATE oaths SET status = 'OPEN', activated_at = $2, void_until = $3,
+         approved_by_operator_id = $4, approved_commitment_hash = commitment_hash,
+         counterparty_token = NULL
+       WHERE id = $1`, [oath.id, now, new Date(now.getTime() + VOID_WINDOW_MS), oath.operator_id]);
+        await logEvent(client, 'oath.activated', {
+            ref: oath.ref, commitment_hash: oath.commitment_hash, approval: 'authenticated_operator',
+        });
+        return { ref: oath.ref, status: 'OPEN', commitment_hash: oath.commitment_hash };
+    });
+}
+export async function rejectDraftAsOperator(oathId, authUserId) {
+    return tx(async (client) => {
+        const { rows } = await client.query(`SELECT o.id, o.ref, o.status FROM oaths o
+       JOIN agents a ON o.agent_id = a.id JOIN operators op ON a.operator_id = op.id
+       WHERE o.id = $1 AND op.auth_user_id = $2 FOR UPDATE OF o`, [oathId, authUserId]);
+        if (!rows.length)
+            throw new GuardrailError(['unknown oath or not its owner']);
+        if (rows[0].status !== 'DRAFT')
+            throw new GuardrailError([`oath is ${rows[0].status}, not DRAFT`]);
+        await client.query(`UPDATE oaths SET status = 'DRAFT_EXPIRED', resolved_at = now(), counterparty_token = NULL WHERE id = $1`, [oathId]);
+        await logEvent(client, 'oath.draft_rejected', { ref: rows[0].ref, approval: 'authenticated_operator' });
+        return { ref: rows[0].ref, status: 'DRAFT_EXPIRED' };
     });
 }
 /** Mutual-consent void inside the 1h window, before any claim. */

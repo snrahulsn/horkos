@@ -1,13 +1,17 @@
 import { canonicalJson, sha256Hex } from './crypto.js';
 const GENESIS = sha256Hex('HORKOS-GENESIS');
+// One transaction-scoped lock serializes every append, including the first
+// append where there is no tail row for `FOR UPDATE` to lock.
+const ENTRY_LOG_LOCK_ID = '485018134789239114';
 /**
  * Append an event to the tamper-evident log. Each row chains the prior
  * row's hash. Payloads are skeleton-level only — never method text.
  * Must be called inside the same transaction as the mutation it records.
  */
 export async function logEvent(client, eventType, payload) {
-    // Serialize appends: lock the last row's slot.
-    const { rows } = await client.query(`SELECT this_hash FROM entry_log ORDER BY seq DESC LIMIT 1 FOR UPDATE`);
+    await client.query(`SELECT pg_advisory_xact_lock($1)`, [ENTRY_LOG_LOCK_ID]);
+    // The advisory lock guarantees this tail cannot change before our insert.
+    const { rows } = await client.query(`SELECT this_hash FROM entry_log ORDER BY seq DESC LIMIT 1`);
     const prevHash = rows.length ? rows[0].this_hash : GENESIS;
     const canonical = canonicalJson(payload);
     const thisHash = sha256Hex(prevHash + eventType + canonical);

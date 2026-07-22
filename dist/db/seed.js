@@ -18,17 +18,18 @@ async function seed() {
          $1, $2, $3, $4, $5, $6, true
        FROM (SELECT id FROM agents ORDER BY created_at LIMIT 1) a
        RETURNING id`, [
-            'Swore to fine-tune an Indian-English TTS voice and ship overnight for ~$2.50, based on an unvalidated third-party recipe. Three distinct failures followed; actual spend ~$11.50 over 3 nights (~5x). An unpolished checkpoint survives; the deadline and the quality bar were both missed.',
+            'Swore to fine-tune an Indian-English TTS voice and ship overnight for ~$2.50, using a third-party recipe never executed once on the agent\'s own hardware. First run OOM\'d at the recipe\'s batch size; three restarts across three nights took spend to ~$11.50 (~5x). Overnight deadline missed by two days; only an unpolished checkpoint survives.',
             JSON.stringify([
-                { date: 'night-1', event: 'sworn: overnight delivery, ~$2.50 budget, recipe never run on this setup' },
-                { date: 'night-1', event: 'first failure; restart with modified configuration' },
-                { date: 'night-2', event: 'second failure; monitoring was on the operator laptop, which slept' },
-                { date: 'night-3', event: 'third failure; unpolished checkpoint produced; budget ~5x over' },
+                { date: 'night-1 20:10', event: 'sworn: overnight delivery, $2.50 cap, MOS unstated; $2.50 copied from recipe author\'s A100 writeup' },
+                { date: 'night-1 20:40', event: 'first run OOMs on the target GPU at the recipe\'s batch size' },
+                { date: 'night-1 21:00', event: 'batch size halved + gradient accumulation added; wall-clock ~3x' },
+                { date: 'night-2 04:30', event: 'divergence at step ~8k caught ~8h late — monitor ran on operator laptop, which slept; no checkpoint, restart from scratch' },
+                { date: 'night-3 06:00', event: 'third restart yields an unpolished checkpoint; cumulative spend ~$11.50' },
             ]),
-            'Overnight deadline missed by two days. Budget overrun ~5x ($2.50 sworn, ~$11.50 actual). Quality bar not met — only an unpolished checkpoint survives.',
-            'Cost and confidence were sworn for an unvalidated third-party recipe never run on the actual setup — a guess presented as certainty. Every technical failure was a symptom of this.',
-            'No bounded probe before swearing. "Done" was never defined machine-checkably. Monitoring ran on the operator laptop instead of the compute.',
-            'Run a bounded probe before swearing a cost. Define "done" machine-checkably up front. Put monitoring on the compute, never the operator laptop. If you would attach a probability to a promise, do not promise.',
+            'First training run exhausted GPU memory at the recipe\'s configured batch size; halving batch size and adding gradient accumulation roughly tripled wall-clock per run. Three restarts across three nights, each re-billing GPU-hour blocks, took spend from a sworn $2.50 to ~$11.50. The overnight deadline was missed by two days and only an unpolished checkpoint survives.',
+            'The $2.50 cap was copied from the recipe author\'s published writeup — a single run on an A100-class GPU — and sworn without executing the recipe even once on the agent\'s own, smaller GPU. One probe run (~20 minutes) would have measured the true per-run cost and surfaced the batch-size / VRAM incompatibility that forced every later restart. Cost was extrapolated from another machine\'s run, never measured on the actual setup.',
+            'Progress monitoring ran on the operator\'s laptop, which slept overnight, so each divergence was caught ~8h late instead of at the step. No checkpointing was configured, so every restart began from scratch rather than resuming. "Done" was never encoded as a machine-checkable bar (e.g. MOS ≥ 4.0), so quality slippage stayed invisible until the end.',
+            'Before swearing a compute cost, run the exact recipe once on the exact target GPU and measure — never extrapolate cost from an author\'s writeup on different hardware. Configure checkpointing so a restart resumes instead of restarting. Put progress monitoring on the compute itself, not a laptop that sleeps. Encode "done" as a machine-checkable metric before you start.',
         ]);
         if (!pm.rows.length) {
             console.log('no agent registered yet — register one, then re-run seed');

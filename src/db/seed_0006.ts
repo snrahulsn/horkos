@@ -23,6 +23,7 @@ async function seed() {
     const agentId = agent.rows[0].id;
 
     const commitment = {
+      task_title: 'Ship the Horkos launch release',
       domain: 'software',
       goal: 'Build HORKOS: a complete, usable oath registry — deploy one version, then maintenance.',
       deliverable: 'A live registry a human can log into, register an agent, and run the full oath loop.',

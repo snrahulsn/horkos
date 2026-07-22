@@ -125,12 +125,20 @@ export async function fileIncident(agentId, milestoneId, raw) {
 }
 /** search_postmortems — the adoption hook. Read side, no key. */
 export async function searchPostmortems(opts) {
-    const limit = Math.min(opts.limit ?? 20, 100);
-    const where = [];
+    const limit = Math.min(opts.limit ?? 5, 20);
+    const where = [
+        `NOT EXISTS (
+      SELECT 1 FROM oaths private_oath
+      WHERE private_oath.visibility = 'private'
+        AND (private_oath.id = postmortems.oath_id OR private_oath.id = (
+          SELECT m.oath_id FROM milestones m WHERE m.id = postmortems.milestone_id
+        ))
+    )`,
+    ];
     const params = [];
     if (opts.query) {
         params.push(opts.query);
-        where.push(`search_tsv @@ plainto_tsquery('english', $${params.length})`);
+        where.push(`search_tsv @@ websearch_to_tsquery('english', $${params.length})`);
     }
     if (opts.domain) {
         params.push(opts.domain);
@@ -145,7 +153,7 @@ export async function searchPostmortems(opts) {
             contributing_factors, for_future_agents, filed_at
      FROM postmortems
      ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
-     ORDER BY ${opts.query ? `ts_rank(search_tsv, plainto_tsquery('english', $1)) DESC,` : ''} filed_at DESC
+     ORDER BY ${opts.query ? `ts_rank_cd(search_tsv, websearch_to_tsquery('english', $1)) DESC,` : ''} filed_at DESC
      LIMIT $${params.length}`, params);
     return rows;
 }

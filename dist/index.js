@@ -1,35 +1,59 @@
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { web } from './web/routes.js';
+import { auth } from './web/authroutes.js';
 import { buildMcpServer } from './mcp/server.js';
 import { registerAgent, agentFromToken } from './core/registry.js';
 import { startScheduler } from './scheduler/index.js';
+import { runMigrations } from './db/migrate.js';
 import { GuardrailError } from './core/commitments.js';
+import { verifyAccessToken } from './web/auth.js';
+import { pool } from './db/pool.js';
+import { ingestGitHubCheckRun } from './integrations/github.js';
+import { verifyProofIngestorConnection } from './core/proofs.js';
 const app = new Hono();
+app.use('*', async (c, next) => {
+    await next();
+    c.header('X-Content-Type-Options', 'nosniff');
+    c.header('X-Frame-Options', 'DENY');
+    c.header('Referrer-Policy', 'no-referrer');
+    c.header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    if (process.env.NODE_ENV === 'production') {
+        c.header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
+});
 // ---------- health ----------
-app.get('/health', (c) => c.json({ ok: true, service: 'horkos', version: '1.0.0' }));
+app.get('/health', async (c) => {
+    try {
+        await pool.query('SELECT 1');
+        return c.json({ ok: true, service: 'horkos', version: '1.0.0' });
+    }
+    catch {
+        return c.json({ ok: false, service: 'horkos' }, 503);
+    }
+});
+app.post('/webhooks/github', async (c) => {
+    try {
+        const body = await c.req.text();
+        const result = await ingestGitHubCheckRun(body, c.req.header('x-hub-signature-256'), c.req.header('x-github-event'));
+        return c.json(result);
+    }
+    catch (error) {
+        const unauthorized = error.message.includes('signature');
+        return c.json({ error: unauthorized ? 'unauthorized' : 'webhook rejected' }, unauthorized ? 401 : 400);
+    }
+});
 // ---------- registration (REST; operator OAuth in front) ----------
-// v1: Supabase Auth JWT arrives as Bearer; we trust its `sub` as auth_user_id.
+// Supabase access tokens are verified with Supabase Auth.
 // Deployments without Supabase configured can register with X-Operator-Id (dev only).
 app.post('/api/register_agent', async (c) => {
     try {
         let authUserId = null;
         const auth = c.req.header('authorization');
-        if (auth?.startsWith('Bearer ') && process.env.SUPABASE_JWT_SECRET) {
-            const { createHmac } = await import('node:crypto');
-            const [h, p, sig] = auth.slice(7).split('.');
-            if (!h || !p || !sig)
-                return c.json({ error: 'malformed JWT' }, 401);
-            const expected = createHmac('sha256', process.env.SUPABASE_JWT_SECRET)
-                .update(`${h}.${p}`)
-                .digest('base64url');
-            if (expected !== sig)
-                return c.json({ error: 'invalid JWT signature' }, 401);
-            const payload = JSON.parse(Buffer.from(p, 'base64url').toString());
-            if (payload.exp && payload.exp * 1000 < Date.now())
-                return c.json({ error: 'JWT expired' }, 401);
-            authUserId = payload.sub;
+        if (auth?.startsWith('Bearer ')) {
+            const user = await verifyAccessToken(auth.slice(7));
+            authUserId = user?.id ?? null;
         }
         else if (process.env.NODE_ENV !== 'production') {
             authUserId = c.req.header('x-operator-id') ?? null;
@@ -43,7 +67,7 @@ app.post('/api/register_agent', async (c) => {
         const result = await registerAgent(authUserId, body.agent_name, body.display_name);
         return c.json({
             ...result,
-            note: 'api_token is shown once. It authenticates MCP write tools. The signing key is custodial and never leaves the server.',
+            note: 'api_token is shown once. It authenticates MCP write tools; only its hash is stored.',
         });
     }
     catch (e) {
@@ -64,19 +88,48 @@ app.all('/mcp', async (c) => {
             agentId = agent.id;
     }
     const server = buildMcpServer(() => agentId);
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     await server.connect(transport);
-    const { incoming, outgoing } = c.env;
-    const body = c.req.method === 'POST' ? await c.req.json().catch(() => undefined) : undefined;
-    await transport.handleRequest(incoming, outgoing, body);
-    // response written directly to the node socket
-    return new Response(null);
+    return transport.handleRequest(c.req.raw);
 });
-// ---------- web ----------
+// ---------- auth + web ----------
+app.route('/', auth);
 app.route('/', web);
 const port = Number(process.env.PORT ?? 3000);
-serve({ fetch: app.fetch, port }, (info) => {
-    console.log(`HORKOS listening on :${info.port}`);
-    startScheduler();
+if (process.env.NODE_ENV === 'production') {
+    const required = [
+        'BASE_URL', 'SESSION_SECRET', 'SUPABASE_URL', 'SUPABASE_ANON_KEY',
+        'PROOF_DATABASE_URL', 'PROOF_INGEST_SECRET', 'GITHUB_WEBHOOK_SECRET',
+        'MERKLE_SIGNING_SEED',
+    ];
+    const missing = required.filter((key) => !process.env[key]);
+    if (missing.length)
+        throw new Error(`missing required production configuration: ${missing.join(', ')}`);
+    if ((process.env.SESSION_SECRET ?? '').length < 32) {
+        throw new Error('SESSION_SECRET must contain at least 32 characters in production');
+    }
+    if ((process.env.PROOF_INGEST_SECRET ?? '').length < 32 || (process.env.GITHUB_WEBHOOK_SECRET ?? '').length < 32) {
+        throw new Error('proof and webhook secrets must contain at least 32 characters in production');
+    }
+    if (!/^[0-9a-f]{64}$/i.test(process.env.MERKLE_SIGNING_SEED ?? '')) {
+        throw new Error('MERKLE_SIGNING_SEED must be exactly 32 bytes encoded as hex');
+    }
+    if (!process.env.BASE_URL?.startsWith('https://')) {
+        throw new Error('BASE_URL must use HTTPS in production');
+    }
+}
+// Migrate on boot (single process, no start-command chain), then listen.
+runMigrations()
+    .then(async () => {
+    if (process.env.NODE_ENV === 'production')
+        await verifyProofIngestorConnection();
+    serve({ fetch: app.fetch, port, hostname: '0.0.0.0' }, (info) => {
+        console.log(`HORKOS listening on ${info.address}:${info.port}`);
+        startScheduler();
+    });
+})
+    .catch((err) => {
+    console.error('startup failed:', err);
+    process.exit(1);
 });
 //# sourceMappingURL=index.js.map

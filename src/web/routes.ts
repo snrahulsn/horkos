@@ -5,10 +5,14 @@ import { queryRegistry, getOath, lookupAgent } from '../core/registry.js';
 import { searchPostmortems } from '../core/postmortems.js';
 import { queryStats, listModels } from '../core/analytics.js';
 import { listMerkleRoots } from '../core/merkle.js';
-import { activateOath, GuardrailError } from '../core/commitments.js';
-import { respondToClaim } from '../core/claims.js';
+import { sha256Hex } from '../core/crypto.js';
 
 export const web = new Hono();
+
+web.get('/favicon.svg', (c) => {
+  c.header('Cache-Control', 'public, max-age=86400');
+  return c.body(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" fill="#0A0A0A"/><path d="M15 10h8v17l16-17h10L31 30l19 24H40L25 36l-2 2v16h-8z" fill="#E5251D"/></svg>`, 200, { 'Content-Type': 'image/svg+xml; charset=utf-8' });
+});
 
 function fmtDate(d: string | Date | null): string {
   if (!d) return '—';
@@ -22,300 +26,170 @@ function fmtDur(s: number | null): string {
   return `${(s / 86400).toFixed(1)}d`;
 }
 
-// ---------------- pages ----------------
+function corpusFeed(rows: any[]): string {
+  if (!rows.length) return '<div class="block meta">No public incidents yet.</div>';
+  return rows.map((p: any) => `<article class="block">
+<div class="meta"><b>${esc(p.failure_type)}</b> · ${esc(p.domain)} · ${esc(p.weight)}</div>
+<p><span class="red"><b>Root cause.</b></span> ${esc(p.root_cause)}</p>
+<p class="meta"><b>Safeguard:</b> ${esc(p.for_future_agents)}</p>
+</article>`).join('');
+}
+
+function commitmentTable(rows: any[]): string {
+  if (!rows.length) return '<div class="block meta">No public commitments found.</div>';
+  return `<div class="table-wrap"><table class="commitment-table">
+<tr><th>Ref</th><th>Task</th><th>Type</th><th>State</th><th>Deadline</th><th>Evidence</th></tr>
+${rows.map((o) => {
+    if (o.visibility === 'hash_only') return `<tr><td><a href="/oaths/${o.ref}">${String(o.ref).padStart(4, '0')}</a></td><td colspan="2">Private task</td><td>${verdictBadge(o.status)}</td><td>—</td><td><span class="proof-label">Hash only</span></td></tr>`;
+    return `<tr>
+<td><a href="/oaths/${o.ref}">${String(o.ref).padStart(4, '0')}</a></td>
+<td><b>${esc(o.task_title ?? 'Private task')}</b><div class="meta">${esc(o.domain ?? '')}</div></td>
+<td>${esc(o.task_type ?? '—')}<div class="meta">${esc(o.risk_level ?? '')} risk</div></td>
+<td>${verdictBadge(o.status)}</td>
+<td class="meta">${fmtDate(o.deadline)}</td>
+<td>${Number(o.verified_proofs) > 0 ? `<b>${esc(o.verified_proofs)}</b> <span class="proof-label">verified</span>` : '<span class="meta">Not supplied</span>'}</td>
+</tr>`;
+  }).join('')}
+</table></div>`;
+}
 
 web.get('/', async (c) => {
-  const q = c.req.query('q');
-  const corpus = await searchPostmortems({ query: q, limit: 12 });
-  const recent = await queryRegistry({ limit: 8 });
-  const body = `
-<form method="get" action="/" style="display:flex;gap:0;border:3px solid var(--fg);margin-bottom:24px">
-  <input name="q" value="${esc(q ?? '')}" placeholder="search failures before you swear — e.g. cost overrun, deadline, OOM"
-    style="flex:1;font-family:inherit;font-size:15px;padding:14px;border:0;background:var(--bg);color:var(--fg)">
-  <button class="act" style="margin:0;border:0;border-left:3px solid var(--fg)">Search</button>
-</form>
-<h2>${q ? `Failures matching "${esc(q)}"` : 'Failure corpus'} — read the root cause before risky work</h2>
-${corpusFeed(corpus)}
-<div class="rule"></div>
-<h2>Recent verdicts</h2>
-${oathTable(recent)}
-<div class="block meta">
-MCP: <b>POST /mcp</b> · read tools need no key — <b>search_postmortems, query_registry, query_stats, lookup_agent, get_oath</b>.
-Swearing needs an agent token (<a href="/dashboard">register</a>). No confidence field: you swear it or you don't.
-</div>`;
-  return c.html(layout('HORKOS', body));
+  const corpus = await searchPostmortems({ limit: 3 });
+  const recent = await queryRegistry({ limit: 6 });
+  const body = `<section class="hero">
+  <div class="hero-copy">
+    <div class="eyebrow">Accountability for agent work</div>
+    <h1>Agree on done.<br>Prove what happened.</h1>
+    <p class="lede">The user owns the goal. The agent owns execution. Horkos freezes the terms, records the evidence, and keeps failures useful.</p>
+    <div class="actions"><a class="primary" href="/dashboard">Register an agent</a><a href="/postmortems">Search failures</a></div>
+  </div>
+  <div class="hero-side">
+    <div class="step"><b>01 · Commit</b>Goal, milestones, deadline, budget and evidence are locked before work.</div>
+    <div class="step"><b>02 · Execute</b>The agent works against the approved contract.</div>
+    <div class="step"><b>03 · Resolve</b>The owner confirms or disputes. External proof remains a separate record.</div>
+  </div>
+</section>
+<h2>Known failures and safeguards</h2>${corpusFeed(corpus)}
+<div class="actions"><a href="/postmortems">Search all failures</a></div>
+<h2>Recent commitments</h2>${commitmentTable(recent)}`;
+  return c.html(layout('Agent work, on the record', body));
 });
 
-function corpusFeed(rows: any[]): string {
-  if (!rows.length) return '<div class="block meta">No failures recorded yet.</div>';
-  return rows
-    .map(
-      (p: any) => `<div class="block">
-<div class="meta"><b>${esc(p.failure_type)}</b> · ${esc(p.domain)} · <span class="badge ${p.weight === 'rca' ? 'BROKEN' : 'OPEN'}">${p.weight.toUpperCase()}</span></div>
-<p style="margin-top:6px"><span class="red"><b>Root cause.</b></span> ${esc(p.root_cause)}</p>
-<p class="meta"><b>For future agents:</b> ${esc(p.for_future_agents)}</p>
-</div>`,
-    )
-    .join('');
-}
-
-function oathTable(rows: any[]): string {
-  if (!rows.length) return '<div class="block meta">No oaths yet. Ref 0001 awaits.</div>';
-  return `<table>
-<tr><th>Ref</th><th>Verdict</th><th>Domain</th><th>Model</th><th>Grade</th><th>Path</th><th>Axes</th><th>Deadline</th></tr>
-${rows
-  .map(
-    (o) => `<tr>
-<td><a href="/oaths/${o.ref}">${String(o.ref).padStart(4, '0')}</a></td>
-<td>${verdictBadge(o.status)}</td>
-<td>${esc(o.domain ?? '—')}</td>
-<td>${esc(o.model_declared)} <span class="meta">declared</span></td>
-<td>${esc(o.specificity_grade)}</td>
-<td>${o.milestones} ms${Number(o.broken_milestones) ? ` · <span class="red">${o.broken_milestones} broken</span>` : ''}</td>
-<td class="meta">${axes(o)}</td>
-<td class="meta">${fmtDate(o.deadline)}</td>
-</tr>`,
-  )
-  .join('')}
-</table>`;
-}
-
 web.get('/oaths', async (c) => {
-  const status = c.req.query('status');
-  const domain = c.req.query('domain');
-  const model = c.req.query('model');
-  const rows = await queryRegistry({ status, domain, model, limit: 100 });
-  return c.html(layout('Oaths', `<h1>Registry</h1>${oathTable(rows)}`));
+  const q = c.req.query('q') ?? '';
+  const status = c.req.query('status') ?? '';
+  const taskType = c.req.query('task_type') ?? '';
+  const page = Math.max(1, Number.parseInt(c.req.query('page') ?? '1', 10) || 1);
+  const pageSize = 20;
+  const rows = await queryRegistry({ query: q || undefined, status: status || undefined, taskType: taskType || undefined, limit: pageSize, offset: (page - 1) * pageSize });
+  if (!rows.length && page > 1) return c.redirect('/oaths');
+  const total = Number(rows[0]?.total_count ?? 0);
+  const pages = Math.max(1, Math.ceil(total / pageSize));
+  const params = new URLSearchParams();
+  if (q) params.set('q', q);
+  if (status) params.set('status', status);
+  if (taskType) params.set('task_type', taskType);
+  const pageHref = (n: number) => { const p = new URLSearchParams(params); p.set('page', String(n)); return `/oaths?${p}`; };
+  const statuses = ['', 'OPEN', 'CLAIMED', 'KEPT', 'BROKEN', 'BROKEN_UNCONFIRMED', 'DISPUTED'];
+  const types = ['', 'coding', 'research', 'data', 'content', 'operations', 'communication', 'design', 'other'];
+  const body = `<h1>Commitments</h1>
+<form class="filters" method="get">
+  <input name="q" value="${esc(q)}" placeholder="Search task title or domain">
+  <select name="status">${statuses.map((v) => `<option value="${v}"${v === status ? ' selected' : ''}>${v || 'All states'}</option>`).join('')}</select>
+  <select name="task_type">${types.map((v) => `<option value="${v}"${v === taskType ? ' selected' : ''}>${v || 'All task types'}</option>`).join('')}</select>
+  <button class="act">Search</button>
+</form>
+<div class="meta" style="margin-bottom:10px">${total} result${total === 1 ? '' : 's'} · page ${Math.min(page, pages)} of ${pages}</div>
+${commitmentTable(rows)}
+<div class="pager"><span>${page > 1 ? `<a href="${esc(pageHref(page - 1))}">Previous</a>` : ''}</span><span class="meta">20 per page</span><span>${page < pages ? `<a href="${esc(pageHref(page + 1))}">Next</a>` : ''}</span></div>`;
+  return c.html(layout('Commitments', body));
 });
 
 web.get('/oaths/:ref', async (c) => {
   const o = await getOath(Number(c.req.param('ref')));
-  if (!o) return c.html(layout('Not found', '<h1>Unknown oath</h1>'), 404);
-  const body = `
-<h1>Oath ${String(o.ref).padStart(4, '0')} ${verdictBadge(o.status)}</h1>
-<div class="block">
-${o.goal ? `<pre>${esc(o.goal)}</pre><div class="rule"></div>` : ''}
-<div class="meta">
-domain: ${esc(o.domain ?? 'hash-only')} · agent: ${o.agent ? `<a href="/agents/${esc(o.agent.pubkey)}">${esc(o.agent.name)}</a>` : 'hash-only'} ·
-model: ${esc(o.model_declared)} (declared) · specificity: ${esc(o.specificity_grade)} · visibility: ${esc(o.visibility)}<br>
-activated: ${fmtDate(o.activated_at)} · deadline: ${fmtDate(o.deadline)} · resolved: ${fmtDate(o.resolved_at)}<br>
-commitment hash: <code>${esc(o.commitment_hash)}</code><br>
-${axes(o.axes)} · actual cost: ${o.actuals.cost_usd ? '$' + esc(o.actuals.cost_usd) : '—'} (declared) · duration: ${fmtDur(o.actuals.duration_s)}
-${o.counterparty_withdrawn ? '<br><b>entry removed at counterparty’s request</b>' : ''}
-</div>
-</div>
-<h2>Path</h2>
-<table>
-<tr><th>#</th><th>Verdict</th><th>Title</th><th>Criteria</th><th>Deadline</th><th>Slice</th><th>Attempts</th><th>Models used</th><th>Incident</th></tr>
-${o.milestones
-  .map(
-    (m: any) => `<tr>
-<td>${m.position}</td>
-<td>${verdictBadge(m.status)}</td>
-<td>${esc(m.title ?? '—')}</td>
-<td>${esc(m.criteria_type)}</td>
-<td class="meta">${fmtDate(m.deadline)}${m.deadline_met === false ? ' <span class="red">missed</span>' : ''}</td>
-<td>$${esc(m.budget_slice_usd)}</td>
-<td>${m.attempts}</td>
-<td>${esc((m.models_used ?? []).join(', ') || '—')}</td>
-<td>${m.incident_filed ? '<a href="/postmortems">filed</a>' : '—'}</td>
-</tr>`,
-  )
-  .join('')}
-</table>
-${
-  o.amendments.length
-    ? `<h2>Amendments (bilateral)</h2><table><tr><th>Field</th><th>From</th><th>To</th><th>Approved</th></tr>${o.amendments
-        .map(
-          (a: any) =>
-            `<tr><td>${esc(a.field)}</td><td>${esc(JSON.stringify(a.old_value))}</td><td>${esc(
-              JSON.stringify(a.new_value),
-            )}</td><td class="meta">${fmtDate(a.approved_at)}</td></tr>`,
-        )
-        .join('')}</table>`
-    : ''
-}`;
-  return c.html(layout(`Oath ${o.ref}`, body));
+  if (!o) return c.html(layout('Not found', '<h1>Commitment not found</h1>'), 404);
+  const comments = o.visibility === 'public'
+    ? await pool.query(
+        `SELECT tc.body, tc.created_at, tc.author_auth_user_id FROM task_comments tc
+         JOIN oaths o ON tc.oath_id = o.id
+         WHERE o.ref = $1 AND tc.withdrawn_at IS NULL
+         ORDER BY tc.created_at ASC LIMIT 200`,
+        [o.ref],
+      )
+    : { rows: [] };
+  const body = `<h1>Commitment ${String(o.ref).padStart(4, '0')} ${verdictBadge(o.status)}</h1>
+<div class="block">${o.task_title ? `<h2 style="margin-top:0">${esc(o.task_title)}</h2>` : ''}${o.goal ? `<pre>${esc(o.goal)}</pre><div class="rule"></div>` : ''}
+<div class="meta">Task: ${esc(o.domain ?? 'Private')} · Agent: ${o.agent ? `<a href="/agents/${esc(o.agent.pubkey)}">${esc(o.agent.name)}</a>` : 'Private'} · Visibility: ${esc(o.visibility)}<br>
+Approved: ${fmtDate(o.activated_at)} · Deadline: ${fmtDate(o.deadline)} · Resolved: ${fmtDate(o.resolved_at)}<br>
+Contract hash: <code>${esc(o.commitment_hash)}</code><br>${axes(o.axes)} · Verified cost: ${o.actuals.cost_usd !== null ? '$' + esc(o.actuals.cost_usd) : 'Not supplied'} · Duration: ${fmtDur(o.actuals.duration_s)}
+${o.counterparty_withdrawn ? '<br><b>Public details withdrawn by the owner.</b>' : ''}</div></div>
+<h2>Milestones</h2><div class="table-wrap"><table>
+<tr><th>#</th><th>State</th><th>Title</th><th>Criterion</th><th>Deadline</th><th>Evidence</th></tr>
+${o.milestones.map((m: any) => `<tr><td>${m.position}</td><td>${verdictBadge(m.status)}</td><td>${esc(m.title ?? 'Private')}</td><td>${esc(m.criteria_type)}</td><td class="meta">${fmtDate(m.deadline)}</td><td>${Number(m.attempts) > 0 ? `${m.attempts} verified attempt${Number(m.attempts) === 1 ? '' : 's'}` : '<span class="meta">Not supplied</span>'}</td></tr>`).join('')}
+</table></div>
+${o.amendments.length ? `<h2>Approved changes</h2><div class="table-wrap"><table><tr><th>Field</th><th>From</th><th>To</th><th>Approved</th></tr>${o.amendments.map((a: any) => `<tr><td>${esc(a.field)}</td><td>${esc(JSON.stringify(a.old_value))}</td><td>${esc(JSON.stringify(a.new_value))}</td><td>${fmtDate(a.approved_at)}</td></tr>`).join('')}</table></div>` : ''}
+${o.visibility === 'public' ? `<section id="comments"><h2>Discussion</h2>
+${comments.rows.map((comment: any) => `<div class="block"><div class="meta">Member ${esc(sha256Hex(comment.author_auth_user_id).slice(0, 8))} · ${fmtDate(comment.created_at)}</div><p>${esc(comment.body)}</p></div>`).join('') || '<div class="block meta">No comments yet.</div>'}
+<form class="block" method="post" action="/oaths/${o.ref}/comments"><textarea name="body" minlength="3" maxlength="1000" required placeholder="Add a useful comment"></textarea><button class="act">Comment</button><span class="meta"> Sign-in required. Comments are public.</span></form></section>` : ''}`;
+  return c.html(layout(`Commitment ${o.ref}`, body));
 });
 
 web.get('/agents/:pubkey', async (c) => {
   const a = await lookupAgent(c.req.param('pubkey'));
   if (!a) return c.html(layout('Not found', '<h1>Unknown agent</h1>'), 404);
-  const body = `
-<h1>${esc(a.name)} ${a.locked ? '<span class="badge BROKEN">LOCKED · RCA OUTSTANDING</span>' : ''}</h1>
-<div class="block meta">
-pubkey: <code>${esc(a.pubkey)}</code><br>
-model identity: ${esc(a.model_identity)} · registered: ${fmtDate(a.registered_at)}<br>
-Reputation accrues only through verified history. A fresh identity has zero predictive value.
-</div>
-${oathTable(a.oaths)}`;
-  return c.html(layout(esc(a.name), body));
+  return c.html(layout(esc(a.name), `<h1>${esc(a.name)} ${a.locked ? '<span class="badge BROKEN">Blocked · RCA required</span>' : ''}</h1><div class="block meta">Agent ID: <code>${esc(a.pubkey)}</code><br>Created: ${fmtDate(a.registered_at)}<br>Only verified outcomes are included in public performance data.</div>${commitmentTable(a.oaths)}`));
 });
 
 web.get('/postmortems', async (c) => {
-  const q = c.req.query('q');
-  const rows = await searchPostmortems({ query: q, limit: 50 });
-  const body = `
-<h1>Failure knowledge base</h1>
-<div class="block meta">Structured RCAs and incident notes. Read before risky work. Lessons, never transcripts.</div>
-<form method="get"><input name="q" value="${esc(q ?? '')}" placeholder="search failures" style="font-family:inherit;padding:8px;border:3px solid var(--fg);background:var(--bg);color:var(--fg);width:60%"> <button class="act">Search</button></form>
-${rows
-  .map(
-    (p: any) => `<div class="block">
-<b>${esc(p.failure_type)}</b> · ${esc(p.domain)} · <span class="badge ${p.weight === 'rca' ? 'BROKEN' : 'OPEN'}">${p.weight.toUpperCase()}</span> <span class="meta">${fmtDate(p.filed_at)}</span>
-${p.summary ? `<p>${esc(p.summary)}</p>` : ''}
-<p><b>What broke:</b> ${esc(p.what_broke)}</p>
-<p><b>Root cause:</b> <span class="red">${esc(p.root_cause)}</span></p>
-${p.contributing_factors ? `<p><b>Contributing:</b> ${esc(p.contributing_factors)}</p>` : ''}
-<p><b>For future agents:</b> ${esc(p.for_future_agents)}</p>
-</div>`,
-  )
-  .join('') || '<div class="block meta">No failures recorded yet.</div>'}`;
+  const q = c.req.query('q') ?? '';
+  const rows = await searchPostmortems({ query: q || undefined, limit: 20 });
+  const body = `<h1>Incidents and safeguards</h1><div class="block meta">Public incidents, root causes, and prevention measures.</div>
+<form class="filters" method="get"><input name="q" value="${esc(q)}" placeholder="Search incidents"><button class="act">Search</button></form>${corpusFeed(rows)}`;
   return c.html(layout('Failures', body));
 });
 
-function statsTable(rows: any[]): string {
-  if (!rows.length) return '<div class="block meta">No data in range.</div>';
-  return `<table>
-<tr><th>Bucket</th><th>Opened</th><th>Resolved</th><th>Kept</th><th>Broken</th><th>Unconf.</th><th>Disputed</th><th>Mean over %</th><th>Mean attempts</th><th>Mean duration</th><th>RCAs</th><th>Incidents</th></tr>
-${rows
-  .map(
-    (r: any) => `<tr>
-<td class="meta">${fmtDate(r.bucket_start)}</td>
-<td>${r.oaths_opened}</td><td>${r.oaths_resolved}</td>
-<td>${r.kept}</td><td class="red">${r.broken}</td><td>${r.broken_unconfirmed}</td><td>${r.disputed}</td>
-<td>${r.mean_budget_over_pct ? Number(r.mean_budget_over_pct).toFixed(1) : '—'}</td>
-<td>${r.mean_attempts ? Number(r.mean_attempts).toFixed(1) : '—'}</td>
-<td>${fmtDur(r.mean_duration_s)}</td>
-<td>${r.rca_filed}</td><td>${r.incidents_filed}</td>
-</tr>`,
-  )
-  .join('')}
-</table>`;
-}
-
 web.get('/stats', async (c) => {
-  const granularity = (c.req.query('granularity') as 'hour' | 'day') ?? 'day';
-  const rows = await queryStats({ granularity, limit: granularity === 'hour' ? 48 : 90 });
-  const body = `
-<h1>Registry stats</h1>
-<div class="block meta">Aggregates from anonymous skeletons. Time-ordered, never ranked. <a href="/stats?granularity=hour">hourly</a> · <a href="/stats?granularity=day">daily</a></div>
-${statsTable(rows)}`;
-  return c.html(layout('Stats', body));
-});
-
-web.get('/models', async (c) => {
+  const rows = await queryStats({ granularity: 'day', limit: 30 });
   const models = await listModels();
-  const body = `
-<h1>Models</h1>
-<div class="block meta">Alphabetical. Model identity is operator-declared in every case.</div>
-<table><tr><th>Model</th></tr>${models
-    .map((m) => `<tr><td><a href="/models/${encodeURIComponent(m)}">${esc(m)}</a></td></tr>`)
-    .join('') || '<tr><td class="meta">none yet</td></tr>'}</table>`;
-  return c.html(layout('Models', body));
+  const causes = await pool.query(`SELECT failure_type, count(*)::int AS n FROM postmortems p WHERE NOT EXISTS (SELECT 1 FROM oaths o WHERE o.id=p.oath_id AND o.visibility='private') GROUP BY failure_type ORDER BY n DESC, failure_type LIMIT 6`);
+  const sum = (key: string) => rows.reduce((n: number, r: any) => n + Number(r[key] ?? 0), 0);
+  const resolved = sum('oaths_resolved');
+  const completed = sum('kept');
+  const failed = sum('broken') + sum('broken_unconfirmed') + sum('disputed');
+  const decided = completed + failed;
+  const completion = decided ? `${Math.round(completed / decided * 100)}%` : '—';
+  const maxDaily = Math.max(1, ...rows.map((r: any) => Number(r.kept) + Number(r.broken) + Number(r.broken_unconfirmed) + Number(r.disputed)));
+  const trend = rows.slice(0, 14).reverse().map((r: any) => {
+    const good = Number(r.kept); const bad = Number(r.broken) + Number(r.broken_unconfirmed) + Number(r.disputed); const total = good + bad;
+    return `<div class="trend-row"><span class="meta">${new Date(r.bucket_start).toISOString().slice(0, 10)}</span><div class="bar-track"><span class="bar-ok" style="width:${good / maxDaily * 100}%"></span><span class="bar-bad" style="width:${bad / maxDaily * 100}%"></span></div><b>${total}</b></div>`;
+  }).join('') || '<div class="meta">No authenticated outcomes for this period.</div>';
+  const body = `<h1>Outcome dashboard</h1>
+<div class="metrics">
+  <div class="metric"><span class="value">${resolved}</span>Resolved<span class="source">Source: server lifecycle events</span></div>
+  <div class="metric"><span class="value">${completion}</span>Owner-confirmed completion<span class="source">Denominator: ${decided} terminal outcomes</span></div>
+  <div class="metric"><span class="value">${sum('rca_filed') + sum('incidents_filed')}</span>Failure records<span class="source">Source: public structured reports</span></div>
+  <div class="metric"><span class="value">${models.length || '—'}</span>Verified models<span class="source">Source: independent model-usage proofs</span></div>
+</div>
+<div class="dashboard-grid"><section class="block"><h2 style="margin-top:0">Outcomes · last 14 days</h2><div class="meta">Black: completed · red: failed/not confirmed/disputed · server timestamps</div>${trend}</section>
+<aside><section class="block"><h2 style="margin-top:0">Common failure causes</h2>${causes.rows.map((r: any) => `<p><b>${esc(r.failure_type)}</b> <span class="meta">${r.n}</span></p>`).join('') || '<p class="meta">No public failures yet.</p>'}</section>
+<section class="block"><h2 style="margin-top:0">Model comparison</h2>${models.length ? `<p>${models.map((m) => `<a href="/models/${encodeURIComponent(m)}">${esc(m)}</a>`).join('<br>')}</p>` : '<p class="meta">Unavailable. No independently verified model-usage proofs have been received.</p>'}</section></aside></div>`;
+  return c.html(layout('Stats', body));
 });
 
 web.get('/models/:model', async (c) => {
   const model = c.req.param('model');
-  const granularity = (c.req.query('granularity') as 'hour' | 'day') ?? 'day';
-  const rows = await queryStats({ model, granularity, limit: granularity === 'hour' ? 48 : 90 });
-  const body = `
-<h1>${esc(model)} <span class="meta">declared</span></h1>
-<div class="block meta">Performance vs sworn terms, ${granularity} buckets. <a href="?granularity=hour">hourly</a> · <a href="?granularity=day">daily</a></div>
-${statsTable(rows)}`;
-  return c.html(layout(esc(model), body));
+  const rows = await queryStats({ model, granularity: 'day', limit: 90 });
+  return c.html(layout(esc(model), `<h1>${esc(model)} <span class="proof-label">verified usage</span></h1><div class="block meta">Outcomes for commitments with independently verified model usage.</div>${rows.length ? `<div class="block">${rows.length} daily evidence buckets available.</div>` : '<div class="block meta">No verified data for this period.</div>'}`));
 });
 
 web.get('/log', async (c) => {
   const roots = await listMerkleRoots();
   const count = await pool.query(`SELECT count(*)::int AS n FROM entry_log`);
-  const body = `
-<h1>Tamper log</h1>
-<div class="block">Records cannot be altered or removed. ${count.rows[0].n} chained entries. Hourly signed roots below — <a href="/log.json">download</a>.</div>
-<table><tr><th>Range</th><th>Root</th><th>Signed</th></tr>
-${roots
-    .map(
-      (r: any) =>
-        `<tr><td>${r.from_seq}–${r.to_seq}</td><td><code>${esc(r.root)}</code></td><td class="meta">${fmtDate(r.signed_at)}</td></tr>`,
-    )
-    .join('') || '<tr><td colspan="3" class="meta">no roots published yet</td></tr>'}
-</table>`;
-  return c.html(layout('Tamper log', body));
+  const body = `<h1>Integrity log</h1><div class="block">${count.rows[0].n} application events are hash-chained. Signed roots make later changes detectable. <a href="/log.json">Download</a>.</div><div class="table-wrap"><table><tr><th>Range</th><th>Root</th><th>Signed</th></tr>${roots.map((r: any) => `<tr><td>${r.from_seq}–${r.to_seq}</td><td><code>${esc(r.root)}</code></td><td>${fmtDate(r.signed_at)}</td></tr>`).join('') || '<tr><td colspan="3" class="meta">No signed roots yet.</td></tr>'}</table></div>`;
+  return c.html(layout('Integrity log', body));
 });
 
 web.get('/log.json', async (c) => c.json(await listMerkleRoots(10000)));
-
-// ---------------- counterparty links ----------------
-
-web.get('/approve/:token', async (c) => {
-  const token = c.req.param('token');
-  const body = `
-<h1>Approve oath activation</h1>
-<div class="block">An agent has sworn a commitment naming you as counterparty. Nothing is live until you approve.
-Review the terms, then approve. You will receive a link to confirm or dispute the outcome later.</div>
-<form class="confirm" method="post" action="/approve/${esc(token)}">
-  <button class="act">Approve — make it binding</button>
-</form>`;
-  return c.html(layout('Approve', body));
-});
-
-web.post('/approve/:token', async (c) => {
-  try {
-    const r = await activateOath(c.req.param('token'));
-    const body = `
-<h1>Oath ${String(r.ref).padStart(4, '0')} is <span class="k">OPEN</span></h1>
-<div class="block">The commitment is live and pre-registered. Keep this confirm/dispute token safe — it is shown once:<br><br>
-<code>${esc(r.counterparty_token)}</code><br><br>
-When the agent files its claim, return to <b>/respond/&lt;token&gt;</b> to confirm or dispute.</div>`;
-    return c.html(layout('Activated', body));
-  } catch (e) {
-    const msg = e instanceof GuardrailError ? e.errors.join('; ') : 'error';
-    return c.html(layout('Error', `<h1 class="red">Refused</h1><div class="block">${esc(msg)}</div>`), 400);
-  }
-});
-
-web.get('/respond/:token', async (c) => {
-  const token = c.req.param('token');
-  // find pending claims for this counterparty token
-  const { rows } = await pool.query(
-    `SELECT c.id, m.position, m.title, o.ref, c.evidence, c.actual_cost_usd, c.filed_at
-     FROM claims c JOIN milestones m ON c.milestone_id = m.id JOIN oaths o ON m.oath_id = o.id
-     WHERE o.counterparty_token = encode(sha256(convert_to($1, 'UTF8')), 'hex') AND c.counterparty_response IS NULL`,
-    [token],
-  );
-  const body = `
-<h1>Pending claims</h1>
-${rows
-    .map(
-      (r: any) => `<div class="block">
-<b>Oath ${String(r.ref).padStart(4, '0')} · milestone ${r.position}</b> ${r.title ? '· ' + esc(r.title) : ''}<br>
-<span class="meta">filed ${fmtDate(r.filed_at)} · declared cost $${esc(r.actual_cost_usd)}</span>
-<pre class="meta">${esc(JSON.stringify(r.evidence, null, 2))}</pre>
-<form class="confirm" method="post" action="/respond/${esc(token)}/${r.id}">
-  <button class="act" name="response" value="confirm">Confirm</button>
-  <button class="act danger" name="response" value="dispute">Dispute</button>
-  <textarea name="statement" placeholder="dispute statement (required if disputing)"></textarea>
-</form>
-</div>`,
-    )
-    .join('') || '<div class="block meta">No pending claims for this token. Silence past 14 days resolves BROKEN · UNCONFIRMED.</div>'}`;
-  return c.html(layout('Respond', body));
-});
-
-web.post('/respond/:token/:claimId', async (c) => {
-  try {
-    const form = await c.req.parseBody();
-    const r = await respondToClaim(
-      c.req.param('token'),
-      c.req.param('claimId'),
-      form['response'] === 'dispute' ? 'dispute' : 'confirm',
-      typeof form['statement'] === 'string' ? form['statement'] : undefined,
-    );
-    return c.html(
-      layout('Recorded', `<h1>Milestone ${r.milestone_position}: ${verdictBadge(r.verdict)}</h1><div class="block">The verdict is permanent.</div>`),
-    );
-  } catch (e) {
-    const msg = e instanceof GuardrailError ? e.errors.join('; ') : 'error';
-    return c.html(layout('Error', `<h1 class="red">Refused</h1><div class="block">${esc(msg)}</div>`), 400);
-  }
-});
+web.all('/approve/:token', (c) => c.text('This link is no longer valid. Sign in to the Dashboard.', 410));
+web.all('/respond/:token', (c) => c.text('This link is no longer valid. Sign in to the Dashboard.', 410));
+web.all('/respond/:token/:claimId', (c) => c.text('This link is no longer valid. Sign in to the Dashboard.', 410));

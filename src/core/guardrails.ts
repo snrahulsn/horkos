@@ -32,11 +32,19 @@ const counterpartySignoff = z.object({
   description: z.string().min(10).max(500),
 });
 
+const githubCheck = z.object({
+  type: z.literal('github_check'),
+  repo: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/),
+  head_sha: z.string().regex(/^[0-9a-fA-F]{40}$/),
+  check_name: z.string().min(1).max(200),
+});
+
 export const criteriaSchema = z.discriminatedUnion('type', [
   testsPass,
   artifactHash,
   metricThreshold,
   counterpartySignoff,
+  githubCheck,
 ]);
 export type Criteria = z.infer<typeof criteriaSchema>;
 
@@ -69,13 +77,19 @@ export const milestoneInputSchema = z
 
 export const commitmentInputSchema = z
   .object({
+    task_title: z.string().min(3).max(160),
     domain: z.string().min(2).max(100),
+    task_type: z.enum(['coding', 'research', 'data', 'content', 'operations', 'communication', 'design', 'other']),
+    complexity: z.enum(['routine', 'bounded', 'complex']),
+    risk_level: z.enum(['low', 'medium', 'high', 'critical']),
+    deliverable_type: z.enum(['code_change', 'artifact', 'report', 'decision', 'deployment', 'data', 'other']),
+    required_tools: z.array(z.string().min(1).max(100)).max(30).default([]),
     goal: z.string().min(10).max(1000),
     deadline: z.string().datetime({ offset: true }), // absolute, required
     budget_cap_usd: z.number().positive().finite(), // required
     model_declared: z.string().min(2).max(100),
-    counterparty_email: z.string().email(),
-    visibility: z.enum(['public', 'category_only', 'hash_only']).default('category_only'),
+    counterparty_email: z.string().email().optional(),
+    visibility: z.enum(['public', 'category_only', 'hash_only', 'private']).default('category_only'),
     milestones: z.array(milestoneInputSchema).min(1).max(50),
   })
   .strict(); // unknown keys (any smuggled confidence field) rejected by construction
@@ -190,6 +204,7 @@ const evidenceValue = z.union([
   z.object({ type: z.literal('artifact_hash'), sha256: z.string().regex(/^[0-9a-f]{64}$/) }),
   z.object({ type: z.literal('metric_threshold'), measured_value: z.number().finite() }),
   z.object({ type: z.literal('counterparty_signoff') }), // resolves via the confirm link itself
+  z.object({ type: z.literal('github_check') }),
 ]);
 
 export const claimInputSchema = z

@@ -10,7 +10,7 @@ import { queryStats } from '../core/analytics.js';
  * resolved by the transport layer); read tools need nothing.
  */
 function ok(data) {
-    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    return { content: [{ type: 'text', text: JSON.stringify(data) }] };
 }
 function fail(err) {
     const msg = err instanceof GuardrailError ? err.errors.join('\n') : err.message;
@@ -29,21 +29,26 @@ export function buildMcpServer(getAgentId) {
         return id;
     }
     // ------------- write side -------------
-    server.tool('create_commitment', 'Swear an oath: a pre-registered public commitment with milestone tree, absolute deadline, and budget cap. ' +
-        'There is no confidence field — you swear it or you don\'t. If you would attach a probability, do not swear. ' +
-        'Returns an activation token you must deliver to the human counterparty; nothing is live until they approve.', {
+    server.tool('create_commitment', 'Propose a structured commitment with milestones, deadline, budget, and evidence criteria. ' +
+        'Nothing starts until the authenticated project owner approves the frozen contract.', {
+        task_title: z.string().min(3).max(160).describe('short human-readable task title'),
         domain: z.string().describe('category, e.g. "ml-training"'),
-        goal: z.string().describe('what you are swearing to deliver (measurable, no hedge language)'),
+        task_type: z.enum(['coding', 'research', 'data', 'content', 'operations', 'communication', 'design', 'other']),
+        complexity: z.enum(['routine', 'bounded', 'complex']),
+        risk_level: z.enum(['low', 'medium', 'high', 'critical']),
+        deliverable_type: z.enum(['code_change', 'artifact', 'report', 'decision', 'deployment', 'data', 'other']),
+        required_tools: z.array(z.string()).max(30).optional(),
+        goal: z.string().describe('measurable deliverable; hedge language is rejected'),
         deadline: z.string().describe('absolute ISO 8601 datetime with offset'),
         budget_cap_usd: z.number().describe('hard budget cap in USD'),
         model_declared: z.string().describe('the model you are running as (operator-declared)'),
-        counterparty_email: z.string().describe('the human counterparty who must approve'),
-        visibility: z.enum(['public', 'category_only', 'hash_only']).optional(),
+        counterparty_email: z.string().optional().describe('legacy notification address; approval always requires the authenticated owner'),
+        visibility: z.enum(['public', 'category_only', 'hash_only', 'private']).optional(),
         milestones: z
             .array(z.object({
             title: z.string(),
             criteria: z.object({
-                type: z.enum(['tests_pass', 'artifact_hash', 'metric_threshold', 'counterparty_signoff']),
+                type: z.enum(['tests_pass', 'artifact_hash', 'metric_threshold', 'counterparty_signoff', 'github_check']),
                 command: z.string().optional(),
                 suite: z.string().optional(),
                 artifact_name: z.string().optional(),
@@ -52,6 +57,9 @@ export function buildMcpServer(getAgentId) {
                 operator: z.enum(['gte', 'lte', 'gt', 'lt', 'eq']).optional(),
                 threshold: z.number().optional(),
                 description: z.string().optional(),
+                repo: z.string().optional(),
+                head_sha: z.string().optional(),
+                check_name: z.string().optional(),
             }),
             deadline: z.string(),
             budget_slice_usd: z.number(),
@@ -66,8 +74,8 @@ export function buildMcpServer(getAgentId) {
             return fail(e);
         }
     });
-    server.tool('log_attempt', 'Record an attempt on a milestone: model and outcome only. No text field exists, by construction — ' +
-        'the registry records how many times and on what, never what was tried.', {
+    server.tool('log_attempt', 'Record private declared telemetry for the owner. It is excluded from public analytics; ' +
+        'public runs and model usage require trusted adapter proofs.', {
         milestone_id: z.string(),
         model: z.string(),
         model_version: z.string().optional(),
@@ -84,7 +92,7 @@ export function buildMcpServer(getAgentId) {
         'The frozen definition judges. Counterparty has 14 days; silence is BROKEN·UNCONFIRMED, never success.', {
         milestone_id: z.string(),
         evidence: z.object({
-            type: z.enum(['tests_pass', 'artifact_hash', 'metric_threshold', 'counterparty_signoff']),
+            type: z.enum(['tests_pass', 'artifact_hash', 'metric_threshold', 'counterparty_signoff', 'github_check']),
             exit_code: z.number().optional(),
             output_hash: z.string().optional(),
             sha256: z.string().optional(),
@@ -124,7 +132,7 @@ export function buildMcpServer(getAgentId) {
             return fail(e);
         }
     });
-    server.tool('file_postmortem', 'File the structured RCA for a broken oath. NTSB-style: dry, factual, root cause distinct from symptoms. ' +
+    server.tool('file_postmortem', 'File the structured RCA for a failed commitment. Keep it factual and separate root cause from symptoms. ' +
         'This is what unlocks a locked identity. No prompts, transcripts, or reasoning traces — post-hoc analysis only.', {
         oath_id: z.string(),
         failure_type: z.string(),
@@ -144,7 +152,7 @@ export function buildMcpServer(getAgentId) {
         }
     });
     // ------------- read side (no key) -------------
-    server.tool('lookup_agent', 'Public record of an agent by pubkey: verdict history, efficiency axes, lock status. No auth needed.', { pubkey: z.string() }, async (args) => {
+    server.tool('lookup_agent', 'Public record of an agent by ID: outcome history and lock status. No auth needed.', { pubkey: z.string() }, async (args) => {
         try {
             const r = await lookupAgent(args.pubkey);
             return r ? ok(r) : fail(new Error('unknown agent'));
@@ -153,21 +161,23 @@ export function buildMcpServer(getAgentId) {
             return fail(e);
         }
     });
-    server.tool('query_registry', 'List public oath skeletons with filters (status, domain, model). No auth needed.', {
+    server.tool('query_registry', 'Search public commitments by title/domain and filter by state or task type. No auth needed.', {
+        query: z.string().max(200).optional(),
         status: z.string().optional(),
         domain: z.string().optional(),
         model: z.string().optional(),
-        limit: z.number().optional(),
+        task_type: z.string().optional(),
+        limit: z.number().int().min(1).max(20).optional(),
         offset: z.number().optional(),
     }, async (args) => {
         try {
-            return ok(await queryRegistry(args));
+            return ok(await queryRegistry({ ...args, taskType: args.task_type }));
         }
         catch (e) {
             return fail(e);
         }
     });
-    server.tool('get_oath', 'Full public view of one oath by ref: milestones, path, attempts, amendments, axes. No auth needed.', { ref: z.number() }, async (args) => {
+    server.tool('get_oath', 'Full public view of one commitment by reference: milestones, evidence, changes, and outcomes. No auth needed.', { ref: z.number() }, async (args) => {
         try {
             const r = await getOath(args.ref);
             return r ? ok(r) : fail(new Error('unknown oath'));
@@ -181,7 +191,7 @@ export function buildMcpServer(getAgentId) {
         query: z.string().optional(),
         domain: z.string().optional(),
         failure_type: z.string().optional(),
-        limit: z.number().optional(),
+        limit: z.number().int().min(1).max(20).optional(),
     }, async (args) => {
         try {
             return ok(await searchPostmortems(args));
@@ -190,8 +200,7 @@ export function buildMcpServer(getAgentId) {
             return fail(e);
         }
     });
-    server.tool('query_stats', 'Registry analytics: kept/broken rates, budget overruns, attempts, by model × domain × time bucket. ' +
-        'Check a model/domain track record before swearing. Time-ordered aggregates, never rankings. No auth needed.', {
+    server.tool('query_stats', 'Registry analytics. Model, cost, and attempt dimensions are absent unless verified by trusted adapters. No auth needed.', {
         model: z.string().optional(),
         domain: z.string().optional(),
         granularity: z.enum(['hour', 'day']).optional(),

@@ -3,7 +3,7 @@
 > The oath registry for autonomous agents.
 > Domain: **horkos.live** · Open source, forever · Runs on donations.
 
-Status: **spec frozen for build** (amended 2026-07-23: milestone oaths, attempt telemetry, analytics — one complete version, no MVP staging). Design done (see `design_export/`).
+Status: **historical design document, not the deployment contract.** The enforceable launch guarantees are in `LAUNCH_SPEC.md`; where this document differs, the launch contract and code win.
 
 ---
 

@@ -14,37 +14,83 @@ export async function buildRollups(granularity: 'hour' | 'day') {
   const trunc = granularity;
   const windowBack = granularity === 'hour' ? `48 hours` : `35 days`;
 
+  // Remove the recomputed window first so dimensions that are no longer
+  // supported by proof cannot survive as stale public rows.
+  await pool.query(
+    `DELETE FROM rollups WHERE granularity = $1 AND bucket_start >= now() - $2::interval`,
+    [granularity, windowBack],
+  );
+
   // Per model×domain plus '*' totals, from resolved milestones joined to oaths.
   await pool.query(
     `
     WITH resolved AS (
       SELECT
         date_trunc('${trunc}', m.resolved_at) AS bucket,
-        o.model_declared AS model,
+        CASE WHEN EXISTS (
+          SELECT 1 FROM proofs p WHERE p.milestone_id = m.id AND p.status = 'verified'
+            AND p.kind = 'model_usage' AND p.assertion->>'model' = o.model_declared
+        ) THEN o.model_declared ELSE '*' END AS model,
         o.domain,
         m.status,
-        m.actual_cost_usd,
+        CASE WHEN EXISTS (
+          SELECT 1 FROM proofs p WHERE p.milestone_id = m.id AND p.status = 'verified'
+            AND p.kind = 'cost'
+        ) THEN m.actual_cost_usd ELSE NULL END AS actual_cost_usd,
         m.budget_slice_usd,
         m.actual_duration_s,
-        (SELECT count(*) FROM attempts a WHERE a.milestone_id = m.id) AS attempts
+        (SELECT count(*) FROM proofs p WHERE p.milestone_id = m.id
+          AND p.status = 'verified' AND p.kind = 'evaluation_run') AS attempts
       FROM milestones m JOIN oaths o ON m.oath_id = o.id
       WHERE m.resolved_at >= now() - interval '${windowBack}'
+        AND o.visibility NOT IN ('private','hash_only')
     ),
     oath_res AS (
-      SELECT date_trunc('${trunc}', resolved_at) AS bucket, model_declared AS model, domain, status,
-             budget_over_pct
+      SELECT date_trunc('${trunc}', resolved_at) AS bucket,
+             CASE WHEN EXISTS (
+               SELECT 1 FROM proofs p WHERE p.oath_id = oaths.id AND p.status = 'verified'
+                 AND p.kind = 'model_usage' AND p.assertion->>'model' = oaths.model_declared
+             ) THEN model_declared ELSE '*' END AS model,
+             domain, status,
+             CASE WHEN EXISTS (
+               SELECT 1 FROM proofs p WHERE p.oath_id = oaths.id
+                 AND p.status = 'verified' AND p.kind = 'cost'
+             ) THEN budget_over_pct ELSE NULL END AS budget_over_pct
       FROM oaths
       WHERE resolved_at >= now() - interval '${windowBack}'
         AND status IN ('KEPT','BROKEN','BROKEN_UNCONFIRMED','DISPUTED','VOIDED','WITHDRAWN')
+        AND visibility NOT IN ('private','hash_only')
+        AND (
+          status IN ('BROKEN','BROKEN_UNCONFIRMED')
+          OR (
+            approved_by_operator_id IS NOT NULL
+            AND EXISTS (
+              SELECT 1 FROM claims c JOIN milestones m ON c.milestone_id = m.id
+              WHERE m.oath_id = oaths.id AND c.responded_by_operator_id = oaths.approved_by_operator_id
+            )
+          )
+        )
     ),
     oath_open AS (
-      SELECT date_trunc('${trunc}', activated_at) AS bucket, model_declared AS model, domain
+      SELECT date_trunc('${trunc}', activated_at) AS bucket,
+             CASE WHEN EXISTS (
+               SELECT 1 FROM proofs p WHERE p.oath_id = oaths.id AND p.status = 'verified'
+                 AND p.kind = 'model_usage' AND p.assertion->>'model' = oaths.model_declared
+             ) THEN model_declared ELSE '*' END AS model,
+             domain
       FROM oaths WHERE activated_at >= now() - interval '${windowBack}'
+        AND visibility NOT IN ('private','hash_only') AND approved_by_operator_id IS NOT NULL
     ),
     pm AS (
       SELECT date_trunc('${trunc}', filed_at) AS bucket, domain, weight,
-             coalesce((SELECT o2.model_declared FROM oaths o2 WHERE o2.id = postmortems.oath_id), '*') AS model
+             coalesce((SELECT o2.model_declared FROM oaths o2 WHERE o2.id = postmortems.oath_id
+               AND EXISTS (SELECT 1 FROM proofs p WHERE p.oath_id = o2.id AND p.status = 'verified'
+                 AND p.kind = 'model_usage' AND p.assertion->>'model' = o2.model_declared)), '*') AS model
       FROM postmortems WHERE filed_at >= now() - interval '${windowBack}'
+        AND NOT EXISTS (
+          SELECT 1 FROM oaths private_oath
+          WHERE private_oath.id = postmortems.oath_id AND private_oath.visibility IN ('private','hash_only')
+        )
     ),
     base AS (
       SELECT bucket, model, domain FROM resolved
@@ -86,7 +132,7 @@ export async function buildRollups(granularity: 'hour' | 'day') {
         AND (d.model = '*' OR orr.model = d.model) AND (d.domain = '*' OR orr.domain = d.domain)),
       (SELECT avg(orr.budget_over_pct) FROM oath_res orr WHERE orr.bucket = d.bucket
         AND (d.model = '*' OR orr.model = d.model) AND (d.domain = '*' OR orr.domain = d.domain)),
-      (SELECT avg(r.attempts) FROM resolved r WHERE r.bucket = d.bucket
+      (SELECT avg(NULLIF(r.attempts, 0)) FROM resolved r WHERE r.bucket = d.bucket
         AND (d.model = '*' OR r.model = d.model) AND (d.domain = '*' OR r.domain = d.domain)),
       (SELECT avg(r.actual_duration_s)::bigint FROM resolved r WHERE r.bucket = d.bucket
         AND (d.model = '*' OR r.model = d.model) AND (d.domain = '*' OR r.domain = d.domain)),
@@ -125,6 +171,15 @@ export const statsQuerySchema = z
 /** query_stats — read side, no key. Time-ordered, never ranked. */
 export async function queryStats(raw: unknown) {
   const q = statsQuerySchema.parse(raw ?? {});
+  if (q.model) {
+    const verified = await pool.query(
+      `SELECT 1 FROM proofs
+       WHERE status = 'verified' AND kind = 'model_usage' AND assertion->>'model' = $1
+       LIMIT 1`,
+      [q.model],
+    );
+    if (!verified.rows.length) return [];
+  }
   const params: unknown[] = [q.granularity, q.model ?? '*', q.domain ?? '*'];
   let where = `granularity = $1 AND model = $2 AND domain = $3`;
   if (q.from) {
@@ -151,7 +206,11 @@ export async function queryStats(raw: unknown) {
 /** Distinct models seen, for /models pages. Alphabetical — never ranked. */
 export async function listModels() {
   const { rows } = await pool.query(
-    `SELECT DISTINCT model FROM rollups WHERE model != '*' ORDER BY model`,
+    `SELECT DISTINCT p.assertion->>'model' AS model
+     FROM proofs p JOIN oaths o ON p.oath_id = o.id
+     WHERE p.status = 'verified' AND p.kind = 'model_usage' AND p.assertion ? 'model'
+       AND o.visibility NOT IN ('private','hash_only')
+     ORDER BY model`,
   );
   return rows.map((r) => r.model);
 }

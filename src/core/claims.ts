@@ -1,4 +1,4 @@
-import { tx } from '../db/pool.js';
+import { pool, tx } from '../db/pool.js';
 import { logEvent } from './entrylog.js';
 import { sha256Hex } from './crypto.js';
 import { GuardrailError } from './commitments.js';
@@ -88,6 +88,16 @@ export async function fileClaim(agentId: string, milestoneId: string, raw: unkno
     const criteria = m.criteria_detail as Criteria;
     const mismatch = evidenceMatchesCriteria(input.evidence, criteria);
     if (mismatch) throw new GuardrailError([`evidence rejected: ${mismatch}`]);
+    if (criteria.type === 'github_check') {
+      const proof = await client.query(
+        `SELECT 1 FROM proofs WHERE milestone_id = $1 AND kind = 'outcome'
+           AND source = 'github_check_run' AND status = 'verified' LIMIT 1`,
+        [milestoneId],
+      );
+      if (!proof.rows.length) {
+        throw new GuardrailError(['evidence rejected: matching successful GitHub Check Run has not been verified']);
+      }
+    }
 
     const claim = await client.query(
       `INSERT INTO claims (milestone_id, evidence, actual_cost_usd, actual_duration_s, response_due)
@@ -177,6 +187,92 @@ export async function respondToClaim(
       [r.milestone_id, now, deadlineMet, budgetMet],
     );
     await logEvent(client, 'milestone.disputed', { ref: r.ref, milestone_position: r.position });
+    await maybeResolveParent(client, r.oath_id, now);
+    return { milestone_position: r.position, verdict: 'DISPUTED' };
+  });
+}
+
+/** Authenticated owner confirmation. This is the production approval path. */
+export async function respondToClaimAsOperator(
+  authUserId: string,
+  claimId: string,
+  response: 'confirm' | 'dispute',
+  disputeStatement?: string,
+) {
+  const { rows } = await pool.query(
+    `SELECT op.id AS operator_id
+     FROM claims c
+     JOIN milestones m ON c.milestone_id = m.id
+     JOIN oaths o ON m.oath_id = o.id
+     JOIN agents a ON o.agent_id = a.id
+     JOIN operators op ON a.operator_id = op.id
+     WHERE c.id = $1 AND op.auth_user_id = $2`,
+    [claimId, authUserId],
+  );
+  if (!rows.length) throw new GuardrailError(['unknown claim or not its owner']);
+
+  const operatorId = rows[0].operator_id;
+  const result = await respondToClaimForOperator(operatorId, claimId, response, disputeStatement);
+  return result;
+}
+
+async function respondToClaimForOperator(
+  operatorId: string,
+  claimId: string,
+  response: 'confirm' | 'dispute',
+  disputeStatement?: string,
+) {
+  const now = new Date();
+  return tx(async (client) => {
+    const { rows } = await client.query(
+      `SELECT c.id AS claim_id, c.counterparty_response, m.id AS milestone_id, m.position,
+              m.deadline AS m_deadline, m.budget_slice_usd, m.actual_cost_usd, c.filed_at,
+              o.id AS oath_id, o.ref
+       FROM claims c JOIN milestones m ON c.milestone_id = m.id
+       JOIN oaths o ON m.oath_id = o.id
+       WHERE c.id = $1 AND o.approved_by_operator_id = $2 FOR UPDATE OF c, m`,
+      [claimId, operatorId],
+    );
+    if (!rows.length) throw new GuardrailError(['claim was not approved by this operator']);
+    const r = rows[0];
+    if (r.counterparty_response) throw new GuardrailError(['claim already resolved']);
+    const deadlineMet = new Date(r.filed_at) <= new Date(r.m_deadline);
+    const budgetMet = Number(r.actual_cost_usd) <= Number(r.budget_slice_usd);
+
+    if (response === 'confirm') {
+      await client.query(
+        `UPDATE claims SET counterparty_response = 'confirm', responded_by_operator_id = $2 WHERE id = $1`,
+        [claimId, operatorId],
+      );
+      const verdict = deadlineMet && budgetMet ? 'KEPT' : 'BROKEN';
+      await client.query(
+        `UPDATE milestones SET status = $2, resolved_at = $3, deadline_met = $4, budget_met = $5 WHERE id = $1`,
+        [r.milestone_id, verdict, now, deadlineMet, budgetMet],
+      );
+      await logEvent(client, 'milestone.resolved', {
+        ref: r.ref, milestone_position: r.position, verdict, approval: 'authenticated_operator',
+      });
+      await maybeResolveParent(client, r.oath_id, now);
+      return { milestone_position: r.position, verdict };
+    }
+
+    if (!disputeStatement || disputeStatement.trim().length < 10)
+      throw new GuardrailError(['dispute requires a statement (min 10 chars)']);
+    await client.query(
+      `UPDATE claims SET counterparty_response = 'dispute', responded_by_operator_id = $2 WHERE id = $1`,
+      [claimId, operatorId],
+    );
+    await client.query(
+      `INSERT INTO dispute_statements (claim_id, party, statement) VALUES ($1,'counterparty',$2)`,
+      [claimId, disputeStatement.trim()],
+    );
+    await client.query(
+      `UPDATE milestones SET status = 'DISPUTED', resolved_at = $2, deadline_met = $3, budget_met = $4 WHERE id = $1`,
+      [r.milestone_id, now, deadlineMet, budgetMet],
+    );
+    await logEvent(client, 'milestone.disputed', {
+      ref: r.ref, milestone_position: r.position, approval: 'authenticated_operator',
+    });
     await maybeResolveParent(client, r.oath_id, now);
     return { milestone_position: r.position, verdict: 'DISPUTED' };
   });

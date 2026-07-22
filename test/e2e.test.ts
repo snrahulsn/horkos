@@ -8,8 +8,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { pool, tx } from '../src/db/pool.js';
 import { registerAgent, lookupAgent, queryRegistry, getOath } from '../src/core/registry.js';
-import { createCommitment, activateOath, GuardrailError } from '../src/core/commitments.js';
-import { logAttempt, fileClaim, respondToClaim, maybeResolveParent } from '../src/core/claims.js';
+import { createCommitment, activateOathAsOperator, GuardrailError } from '../src/core/commitments.js';
+import { logAttempt, fileClaim, respondToClaimAsOperator, maybeResolveParent } from '../src/core/claims.js';
 import { filePostmortem, fileIncident, searchPostmortems } from '../src/core/postmortems.js';
 import { buildRollups, queryStats } from '../src/core/analytics.js';
 import { verifyChain } from '../src/core/entrylog.js';
@@ -18,11 +18,18 @@ const future = (h: number) => new Date(Date.now() + h * 3600_000).toISOString();
 
 function baseCommitment(overrides: Record<string, unknown> = {}) {
   return {
+    task_title: 'Ship a verified TTS checkpoint',
     domain: 'ml-training',
+    task_type: 'coding',
+    complexity: 'complex',
+    risk_level: 'high',
+    deliverable_type: 'artifact',
+    required_tools: ['gpu', 'ci'],
     goal: 'Fine-tune TTS model to MOS >= 4.0 and ship checkpoint artifact with hash',
     deadline: future(48),
     budget_cap_usd: 20,
     model_declared: 'claude-opus-4-8',
+    visibility: 'public',
     counterparty_email: 'human@example.com',
     milestones: [
       {
@@ -44,9 +51,10 @@ function baseCommitment(overrides: Record<string, unknown> = {}) {
 
 let agentId: string;
 let pubkey: string;
+const authUserId = `test-op-${Date.now()}`;
 
 test('register agent', async () => {
-  const r = await registerAgent(`test-op-${Date.now()}`, `test-agent-${Date.now()}`);
+  const r = await registerAgent(authUserId, `test-agent-${Date.now()}`);
   agentId = r.agent_id;
   pubkey = r.pubkey;
   assert.ok(r.api_token.length === 64);
@@ -86,7 +94,6 @@ test('guardrails: milestone deadline may not exceed parent', async () => {
 
 let oathId: string;
 let oathRef: number;
-let cpToken: string;
 let ms1: string, ms2: string;
 
 test('swear + activate the happy-path oath', async () => {
@@ -96,17 +103,16 @@ test('swear + activate the happy-path oath', async () => {
   assert.equal(draft.status, 'DRAFT');
   assert.ok(['A', 'B', 'C'].includes(draft.specificity_grade!));
 
-  const act = await activateOath(draft.activation_token);
+  const act = await activateOathAsOperator(draft.oath_id, authUserId);
   assert.equal(act.status, 'OPEN');
-  cpToken = act.counterparty_token;
 
   const { rows } = await pool.query(
     `SELECT id FROM milestones WHERE oath_id = $1 ORDER BY position`, [oathId]);
   [ms1, ms2] = rows.map((r) => r.id);
 });
 
-test('activation token is one-time', async () => {
-  await assert.rejects(activateOath('not-a-real-token'));
+test('authenticated approval is one-time', async () => {
+  await assert.rejects(activateOathAsOperator(oathId, authUserId));
 });
 
 test('attempt ledger: counts and models, no text possible', async () => {
@@ -127,7 +133,7 @@ test('claim milestone 1 + confirm -> KEPT', async () => {
     actual_duration_s: 3600,
   });
   assert.ok(claim.claim_id);
-  const verdict = await respondToClaim(cpToken, claim.claim_id, 'confirm');
+  const verdict = await respondToClaimAsOperator(authUserId, claim.claim_id, 'confirm');
   assert.equal(verdict.verdict, 'KEPT');
 });
 
@@ -148,7 +154,7 @@ test('claim milestone 2 + dispute -> DISPUTED, parent DISPUTED', async () => {
     actual_cost_usd: 9,
     actual_duration_s: 7200,
   });
-  const verdict = await respondToClaim(cpToken, claim.claim_id, 'dispute', 'The checkpoint does not load.');
+  const verdict = await respondToClaimAsOperator(authUserId, claim.claim_id, 'dispute', 'The checkpoint does not load.');
   assert.equal(verdict.verdict, 'DISPUTED');
   const o = await getOath(oathRef);
   assert.equal(o!.status, 'DISPUTED');
@@ -190,7 +196,7 @@ test('deadline expiry breaks milestone and locks identity', async () => {
   const draft = await createCommitment(agentId, c);
   brokeOathId = draft.oath_id;
   brokeRef = draft.ref;
-  await activateOath(draft.activation_token);
+  await activateOathAsOperator(draft.oath_id, authUserId);
   const { rows } = await pool.query(
     `SELECT id FROM milestones WHERE oath_id = $1 ORDER BY position`, [brokeOathId]);
   [bm1, bm2] = rows.map((r) => r.id);
@@ -287,25 +293,23 @@ test('rollups + query_stats', async () => {
   const stats = await queryStats({ granularity: 'day', limit: 10 });
   assert.ok(stats.length >= 1);
   const model = await queryStats({ model: 'claude-opus-4-8', granularity: 'day', limit: 10 });
-  assert.ok(model.length >= 1);
-  assert.ok(model.some((r: any) => r.broken > 0 || r.disputed > 0));
+  assert.deepEqual(model, [], 'declared model data must not enter public analytics');
 });
 
 test('registry reads: lookup, list, oath view with path', async () => {
   const a = await lookupAgent(pubkey);
-  assert.equal(a!.model_identity, 'operator-declared');
   assert.ok(a!.oaths.length >= 2);
 
   const list = await queryRegistry({ domain: 'ml-training', limit: 10 });
   assert.ok(list.length >= 2);
+  assert.ok(list.every((row) => Number(row.total_count) >= list.length));
+  const searched = await queryRegistry({ query: 'verified TTS checkpoint', limit: 10 });
+  assert.ok(searched.some((row) => row.task_title === 'Ship a verified TTS checkpoint'));
 
   const o = await getOath(oathRef);
   assert.equal(o!.milestones.length, 2);
-  assert.equal(Number(o!.milestones[0].attempts), 3);
-  assert.deepEqual(
-    [...(o!.milestones[0].models_used ?? [])].sort(),
-    ['claude-opus-4-8', 'claude-sonnet-5'],
-  );
+  assert.equal(Number(o!.milestones[0].attempts), 0, 'private declared attempts are not public proof');
+  assert.deepEqual(o!.milestones[0].models_used, null, 'declared models are not public proof');
 });
 
 test('entry log chain verifies end to end', async () => {
