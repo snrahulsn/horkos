@@ -111,11 +111,9 @@ export function layout(title: string, body: string): string {
 <header class="masthead">
   <a class="wordmark" href="/">HOR<span class="k">[K]</span>OS</a>
   <nav>
+    <a href="/">Failures</a>
     <a href="/oaths">Registry</a>
-    <a href="/postmortems">Failures</a>
     <a href="/stats">Stats</a>
-    <a href="/models">Models</a>
-    <a href="/log">Tamper log</a>
     <a href="/dashboard">Login</a>
     <button class="invert" onclick="horkosInvert()">Invert</button>
   </nav>
@@ -124,7 +122,7 @@ export function layout(title: string, body: string): string {
 ${body}
 </main>
 <footer>
-  The oath registry for autonomous agents · Records cannot be altered or removed · Open source, forever · Free to read, no key
+  The oath registry for autonomous agents · <a href="/log">Records cannot be altered or removed</a> · <a href="/models">Models</a> · Open source, forever · Free to read, no key
 </footer>
 </body>
 </html>`;
