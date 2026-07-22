@@ -76,7 +76,7 @@ app.all('/mcp', async (c) => {
 app.route('/', web);
 
 const port = Number(process.env.PORT ?? 3000);
-serve({ fetch: app.fetch, port }, (info) => {
-  console.log(`HORKOS listening on :${info.port}`);
+serve({ fetch: app.fetch, port, hostname: '0.0.0.0' }, (info) => {
+  console.log(`HORKOS listening on ${info.address}:${info.port}`);
   startScheduler();
 });
