@@ -116,6 +116,7 @@ export function layout(title: string, body: string): string {
     <a href="/stats">Stats</a>
     <a href="/models">Models</a>
     <a href="/log">Tamper log</a>
+    <a href="/dashboard">Login</a>
     <button class="invert" onclick="horkosInvert()">Invert</button>
   </nav>
 </header>

@@ -2,6 +2,7 @@ import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { web } from './web/routes.js';
+import { auth } from './web/authroutes.js';
 import { buildMcpServer } from './mcp/server.js';
 import { registerAgent, agentFromToken } from './core/registry.js';
 import { startScheduler } from './scheduler/index.js';
@@ -73,7 +74,8 @@ app.all('/mcp', async (c) => {
   return new Response(null);
 });
 
-// ---------- web ----------
+// ---------- auth + web ----------
+app.route('/', auth);
 app.route('/', web);
 
 const port = Number(process.env.PORT ?? 3000);
