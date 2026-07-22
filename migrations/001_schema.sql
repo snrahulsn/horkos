@@ -254,9 +254,10 @@ CREATE TABLE postmortems (
   for_future_agents    text NOT NULL,          -- 'lesson' for incidents
 
   search_tsv           tsvector,
+  founding             boolean NOT NULL DEFAULT false, -- RCA #0001 predates the registry
   filed_at             timestamptz NOT NULL DEFAULT now(),
   CHECK (
-    (weight = 'rca' AND oath_id IS NOT NULL
+    (weight = 'rca' AND (oath_id IS NOT NULL OR founding)
       AND summary IS NOT NULL AND timeline IS NOT NULL AND contributing_factors IS NOT NULL)
     OR
     (weight = 'incident' AND milestone_id IS NOT NULL)
