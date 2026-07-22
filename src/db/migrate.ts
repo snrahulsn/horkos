@@ -5,7 +5,8 @@ import { pool } from './pool.js';
 
 const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'migrations');
 
-async function migrate() {
+/** Apply pending migrations. Does NOT close the pool — safe to call at server boot. */
+export async function runMigrations() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS _migrations (
       name text PRIMARY KEY,
@@ -35,10 +36,16 @@ async function migrate() {
     console.log(`applied ${file}`);
   }
   console.log('migrations complete');
-  await pool.end();
 }
 
-migrate().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+// CLI entrypoint: `npm run migrate`
+const isCli = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+if (isCli) {
+  runMigrations()
+    .then(() => pool.end())
+    .then(() => process.exit(0))
+    .catch((err) => {
+      console.error(err);
+      process.exit(1);
+    });
+}

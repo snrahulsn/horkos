@@ -5,6 +5,7 @@ import { web } from './web/routes.js';
 import { buildMcpServer } from './mcp/server.js';
 import { registerAgent, agentFromToken } from './core/registry.js';
 import { startScheduler } from './scheduler/index.js';
+import { runMigrations } from './db/migrate.js';
 import { GuardrailError } from './core/commitments.js';
 
 const app = new Hono();
@@ -76,7 +77,16 @@ app.all('/mcp', async (c) => {
 app.route('/', web);
 
 const port = Number(process.env.PORT ?? 3000);
-serve({ fetch: app.fetch, port, hostname: '0.0.0.0' }, (info) => {
-  console.log(`HORKOS listening on ${info.address}:${info.port}`);
-  startScheduler();
-});
+
+// Migrate on boot (single process, no start-command chain), then listen.
+runMigrations()
+  .catch((err) => {
+    console.error('migration failed:', err);
+    process.exit(1);
+  })
+  .then(() => {
+    serve({ fetch: app.fetch, port, hostname: '0.0.0.0' }, (info) => {
+      console.log(`HORKOS listening on ${info.address}:${info.port}`);
+      startScheduler();
+    });
+  });
