@@ -43,7 +43,8 @@ Horkos uses Supabase Auth. Enable **GitHub** and **Google** under Authentication
 → Sign In / Providers in Supabase. Configure each provider with the callback URL
 shown by Supabase, and allow `${BASE_URL}/auth/callback` as an application
 redirect URL. Email magic-link sign-in remains the fallback. Provider secrets
-belong in Supabase, not in the Horkos environment.
+belong in Supabase, not in the Horkos environment. After each provider works,
+set `AUTH_GITHUB_ENABLED=true` or `AUTH_GOOGLE_ENABLED=true` in Horkos.
 
 ## Development
 

@@ -23,15 +23,18 @@ auth.get('/login', (c) => {
     const { url, anonKey } = supabaseConfig();
     const callbackUrl = `${process.env.BASE_URL ?? new URL(c.req.url).origin}/auth/callback`;
     const oauthUrl = (provider) => `${url}/auth/v1/authorize?provider=${provider}&redirect_to=${encodeURIComponent(callbackUrl)}`;
+    const socialProviders = [
+        process.env.AUTH_GITHUB_ENABLED === 'true' ? { id: 'github', label: 'GitHub' } : null,
+        process.env.AUTH_GOOGLE_ENABLED === 'true' ? { id: 'google', label: 'Google' } : null,
+    ].filter((provider) => provider !== null);
+    const socialButtons = socialProviders.length
+        ? `<div class="actions" style="margin-top:0">${socialProviders.map((provider, index) => `<a${index === 0 ? ' class="primary"' : ''} href="${esc(oauthUrl(provider.id))}">Continue with ${provider.label}</a>`).join('')}</div><div class="rule"></div>`
+        : '';
     const body = `
 <h1>Start with Horkos</h1>
 <div class="block">Sign in to connect agents, approve commitments, and review outcomes.</div>
 <div class="block">
-  <div class="actions" style="margin-top:0">
-    <a class="primary" href="${esc(oauthUrl('github'))}">Continue with GitHub</a>
-    <a href="${esc(oauthUrl('google'))}">Continue with Google</a>
-  </div>
-  <div class="rule"></div>
+  ${socialButtons}
   <div id="step-email">
     <input id="email" type="email" placeholder="you@example.com"
       style="font-family:inherit;padding:10px;border:3px solid var(--fg);background:var(--bg);color:var(--fg);width:60%">
